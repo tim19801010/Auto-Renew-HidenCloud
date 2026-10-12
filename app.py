@@ -50,7 +50,6 @@ def get_current_ip(proxy_server=None):
     proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
         resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-        # log(f"请求出口IP完成, status={resp.status_code}")
         if resp.status_code == 200:
             return resp.text.strip()
         return "获取失败"
@@ -246,13 +245,7 @@ def _dump_security_page(page):
         srcs = page.evaluate(
             "() => Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(Boolean)"
         )
-
-        buttons = page.evaluate(
-            "() => Array.from(document.querySelectorAll('button, input[type=submit], a.btn')).map(b => (b.innerText || b.value || '').trim()).filter(t => t && t.length < 40)"
-        )
-        # log(f"🔍 验证页按钮: {buttons}")
         body = page.evaluate("() => document.body ? document.body.innerText.slice(0, 200) : ''")
-        # log(f"🔍 验证页正文: {body}")
     except Exception as e:
         log(f"🔍 验证页信息采集失败: {e}")
 
@@ -281,7 +274,6 @@ def handle_cloudflare(page, timeout=240):
         if not challenge_active():
             clear_rounds += 1
             if clear_rounds >= 2: 
-                # log("✅ Turnstile 安全验证通过！")
                 return True
             time.sleep(1)
             continue
@@ -332,7 +324,7 @@ def solve_modal_turnstile(page, timeout=90):
             time.sleep(1)
             continue
         no_frame_seconds = 0
-        # 2) 已点击过且框内复选框消失（变成对勾）→ 视为通过（token 字段名可能被站点自定义时兜底）
+        # 2) 已点击过且框内复选框消失（变成对勾）→ 视为通过
         if clicks > 0 and time.time() - last_click > 4 and not _cf_checkbox_visible(page):
             time.sleep(2)
             if not _cf_checkbox_visible(page):
@@ -418,7 +410,7 @@ def login(page):
             page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
             handle_cloudflare(page, timeout=240)
             time.sleep(2)
-            handle_cloudflare(page, timeout=60)  # 跳转后可能再次出现验证页
+            handle_cloudflare(page, timeout=60)
             if _is_logged_in(page):
                 log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
                 return True
@@ -428,6 +420,7 @@ def login(page):
 
     # 2. 账号密码登录
     if not EMAIL or not PASSWORD:
+        log("❌ 未配置 EMAIL/PASSWORD，无法进行账号密码登录")
         return False
     log("💣 尝试账号密码登录...")
     try:
@@ -436,11 +429,9 @@ def login(page):
         time.sleep(2)
         
         log("⌨️ 输入账号密码...")
-        # 真实表单字段：input[name="username"]（可填邮箱或用户名）/ input[name="password"]
         user_input = page.locator('input[name="username"], input[name="email"], input[type="email"]').first
         pwd_input = page.locator('input[name="password"], input[type="password"]').first
         try:
-            # 登录表单要等安全验证页通过后才会渲染
             user_input.wait_for(state="visible", timeout=30000)
         except Exception:
             handle_cloudflare(page, timeout=120)
@@ -546,12 +537,32 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page):
-
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+
+        # 检查是否已存在待支付的续期账单（比如系统或上次运行已生成）
+        pending_invoice = page.locator('a[href*="/payment/invoice/"], a:has-text("view and pay"), a:has-text("View and pay")').first
+        try:
+            if pending_invoice.is_visible():
+                log("ℹ️ 检测到已存在未支付发票，直接前往发票页面...")
+                pending_invoice.click()
+                time.sleep(3)
+                handle_cloudflare(page)
+                if "/payment/invoice/" in page.url:
+                    log(f"🎉 页面已跳转至发票: {page.url}")
+                    pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+                    pay_btn.wait_for(state="visible", timeout=30000)
+                    pay_btn.click()
+                    log("✅ Pay 按钮已点击")
+                    time.sleep(5)
+                    page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                    handle_cloudflare(page)
+                    return True
+        except Exception as e:
+            log(f"⚠️ 检查未支付发票时出错（可忽略）: {e}")
 
         log("🖱️ 准备点击 Renew 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
@@ -565,23 +576,35 @@ def renew_service(page):
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
 
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
-                time.sleep(3)
-                page_text = page.locator("body").inner_text()
-                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                    log("⚠️ 未到续期时间，无法续期。")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
+                # 动态轮询检测是否出现“未到续期时间”提示或正常弹出 Create Invoice
+                start_poll = time.time()
+                while time.time() - start_poll < 8:
+                    time.sleep(1)
+                    page_text = page.locator("body").inner_text().lower()
+                    if any(k in page_text for k in [
+                        "renewal restricted", "can only renew", "you can only renew", 
+                        "renouvellement restreint", "too early"
+                    ]):
+                        log("⚠️ 未到续期时间，无法续期。")
+                        page.screenshot(path="renew_not_allowed.png")
+                        return "NOT_TIME"   # 特殊状态
 
-                log("🖲️ 等待弹窗出现...")
-                try:
-                    create_btn.wait_for(state="visible", timeout=8000)
-                    modal_opened = True
-                    log("✅ 弹窗已成功弹出！")
+                    if create_btn.is_visible():
+                        modal_opened = True
+                        log("✅ 弹窗已成功弹出！")
+                        break
+
+                    # 检查是否直接跳转或出现未支付发票
+                    if "/payment/invoice/" in page.url:
+                        modal_opened = True
+                        log("✅ 已直接进入发票页面！")
+                        break
+
+                if modal_opened:
                     break
-                except:
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
-                    time.sleep(2)
+
+                log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+                time.sleep(2)
             except Exception as e:
                 log(f"❌ 点击尝试出错: {e}")
 
@@ -590,45 +613,48 @@ def renew_service(page):
             page.screenshot(path="renew_modal_failed.png")
             return False
 
-        # 弹窗内先完成 Turnstile 人机验证，再提交
-        handle_cloudflare(page, timeout=60)
-        if not solve_modal_turnstile(page, timeout=90):
-            log("⚠️ Turnstile 未确认通过，仍将尝试提交...")
-            page.screenshot(path="turnstile_timeout.png")
+        if "/payment/invoice/" in page.url:
+            new_invoice_url = page.url
+        else:
+            # 弹窗内先完成 Turnstile 人机验证，再提交
+            handle_cloudflare(page, timeout=60)
+            if not solve_modal_turnstile(page, timeout=90):
+                log("⚠️ Turnstile 未确认通过，仍将尝试提交...")
+                page.screenshot(path="turnstile_timeout.png")
 
-        # 点击 Create Invoice；未跳转说明验证未通过/已过期，重做验证后再试
-        new_invoice_url = None
-        for attempt in range(6):
-            log(f"🖱️ 点击 'Create Invoice'（第 {attempt + 1} 次）...")
-            try:
-                create_btn.wait_for(state="visible", timeout=20000)
-                create_btn.click(timeout=20000)
-            except Exception as e:
-                log(f"⚠️ 点击 Create Invoice 失败: {e}")
-                solve_modal_turnstile(page, timeout=45)
-                continue
+            # 点击 Create Invoice；未跳转说明验证未通过/已过期，重做验证后再试
+            new_invoice_url = None
+            for attempt in range(6):
+                log(f"🖱️ 点击 'Create Invoice'（第 {attempt + 1} 次）...")
+                try:
+                    create_btn.wait_for(state="visible", timeout=20000)
+                    create_btn.click(timeout=20000)
+                except Exception as e:
+                    log(f"⚠️ 点击 Create Invoice 失败: {e}")
+                    solve_modal_turnstile(page, timeout=45)
+                    continue
 
-            start_wait = time.time()
-            while time.time() - start_wait < 30:
-                if "/payment/invoice/" in page.url:
-                    new_invoice_url = page.url
-                    log(f"🎉 页面已跳转: {new_invoice_url}")
+                start_wait = time.time()
+                while time.time() - start_wait < 30:
+                    if "/payment/invoice/" in page.url:
+                        new_invoice_url = page.url
+                        log(f"🎉 页面已跳转: {new_invoice_url}")
+                        break
+                    # 出现整页 Cloudflare 拦截/安全验证页时先处理
+                    if _has_interstitial_iframe(page) or _is_security_check_page(page):
+                        log("⚠️ 遇到整页拦截，尝试处理...")
+                        handle_cloudflare(page, timeout=60)
+                    time.sleep(1)
+                if new_invoice_url:
                     break
-                # 出现整页 Cloudflare 拦截/安全验证页时先处理（弹窗内的 Turnstile 组件交给 solve_modal_turnstile）
-                if _has_interstitial_iframe(page) or _is_security_check_page(page):
-                    log("⚠️ 遇到整页拦截，尝试处理...")
-                    handle_cloudflare(page, timeout=60)
-                time.sleep(1)
-            if new_invoice_url:
-                break
 
-            log("⚠️ 未跳转到发票页面，尝试重新完成 Turnstile 验证后重试...")
-            solve_modal_turnstile(page, timeout=45)
+                log("⚠️ 未跳转到发票页面，尝试重新完成 Turnstile 验证后重试...")
+                solve_modal_turnstile(page, timeout=45)
 
-        if not new_invoice_url:
-            log("❌ 未能进入发票页面，超时。")
-            page.screenshot(path="renew_stuck_invoice.png")
-            return False
+            if not new_invoice_url:
+                log("❌ 未能进入发票页面，超时。")
+                page.screenshot(path="renew_stuck_invoice.png")
+                return False
 
         if page.url != new_invoice_url:
             page.goto(new_invoice_url)
