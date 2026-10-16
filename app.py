@@ -536,143 +536,86 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
-def _pay_invoice_url(page, invoice_url):
-    """打开账单支付页并完成支付。只在 /payment/invoice/ 页面内操作，绝不碰充值表单。返回 True/False。"""
-    try:
-        if "/payment/invoice/" not in invoice_url:
-            log(f"⚠️ 非账单链接，跳过: {invoice_url}")
-            return False
-        if page.url != invoice_url:
-            page.goto(invoice_url, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        time.sleep(3)
-        low = page.locator("body").inner_text().lower()
-        if any(k in low for k in ["already paid", "paid in full", "payment completed",
-                                  "this invoice has been paid", "invoice is paid",
-                                  "invoice has been paid", "已支付", "已付款"]):
-            log("ℹ️ 该账单已支付，无需操作")
-            return True
-        if "invoice" not in low:
-            log("⚠️ 页面不像账单页，拒绝操作")
-            page.screenshot(path="pay_not_invoice.png")
-            return False
-        pay_btn = page.locator('button:has-text("Pay Now")').first
-        try:
-            pay_btn.wait_for(state="visible", timeout=15000)
-        except Exception:
-            log("⚠️ 账单页未找到 Pay Now 按钮")
-            page.screenshot(path="pay_no_button.png")
-            return False
-        log("✅ 点击 Pay Now 支付账单...")
-        pay_btn.scroll_into_view_if_needed()
-        pay_btn.click(timeout=15000)
-        time.sleep(6)
-        handle_cloudflare(page)
-        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        return True
-    except Exception as e:
-        log(f"❌ 支付账单异常: {e}")
-        page.screenshot(path="pay_error.png")
-        return False
-
-
-def _find_new_period_invoice(page, due_date):
-    """在发票列表中找周期起始日 == 当前到期日的新账单，返回支付链接或 None"""
-    try:
-        page.goto(f"{BASE_URL}/invoices", wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        time.sleep(3)
-        html = page.content()
-        norm = lambda s: s.replace(" 0", " ").strip()
-        due_norm = norm(due_date)
-        period_re = re.compile(r"Renewal [^[]*\[(\d{1,2} \w{3} \d{4})\s*-\s*(\d{1,2} \w{3} \d{4})\]")
-        link_re = re.compile(r'href="([^"]*/payment/invoice/[^"]+)"')
-        for lm in link_re.finditer(html):
-            seg = html[max(0, lm.start() - 2000):lm.start()]
-            periods = list(period_re.finditer(seg))
-            if periods and norm(periods[-1].group(1)) == due_norm:
-                log(f"🎯 找到新周期账单 [{periods[-1].group(1)} - {periods[-1].group(2)}]")
-                return lm.group(1)
-        log(f"ℹ️ 发票列表中没有起始日为 {due_date} 的新账单")
-        return None
-    except Exception as e:
-        log(f"⚠️ 查找新周期账单失败: {e}")
-        return None
-
-
 def renew_service(page):
-    """返回: True=成功, "NOT_TIME"=未到续期时间, "NO_INVOICE"=新账单未生成, False=失败"""
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
 
-        not_time_keys = [
-            "renewal restricted", "can only renew", "you can only renew",
-            "renouvellement restreint", "too early"
-        ]
-
-        def _check_not_time():
-            try:
-                page_text = page.locator("body").inner_text().lower()
-                if any(k in page_text for k in not_time_keys):
-                    log("⚠️ 未到续期时间，无法续期。")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return True
-            except Exception:
-                pass
-            return False
-
-        # ---- 步骤1: 服务页账单链接（10-12 成功路径）。
-        #      只认 /payment/invoice/ 链接，绝不自动点任何 "Pay" 按钮
-        #      （发票列表页有 €50 充值表单，误点有扣费风险）
+        # 检查是否已存在待支付的续期账单（比如系统或上次运行已生成）
+        pending_invoice = page.locator('a[href*="/payment/invoice/"], a:has-text("view and pay"), a:has-text("View and pay")').first
         try:
-            pending = page.locator('a[href*="/payment/invoice/"]').first
-            if pending.is_visible():
-                href = pending.get_attribute("href")
-                log("ℹ️ 服务页发现账单链接，直接支付")
-                return _pay_invoice_url(page, href)
+            if pending_invoice.is_visible():
+                log("ℹ️ 检测到已存在未支付发票，直接前往发票页面...")
+                pending_invoice.click()
+                time.sleep(3)
+                handle_cloudflare(page)
+                if "/payment/invoice/" in page.url:
+                    log(f"🎉 页面已跳转至发票: {page.url}")
+                    pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+                    pay_btn.wait_for(state="visible", timeout=30000)
+                    pay_btn.click()
+                    log("✅ Pay 按钮已点击")
+                    time.sleep(5)
+                    page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                    handle_cloudflare(page)
+                    return True
         except Exception as e:
-            log(f"⚠️ 检查服务页账单链接时出错（可忽略）: {e}")
+            log(f"⚠️ 检查未支付发票时出错（可忽略）: {e}")
 
-        # ---- 步骤2: 点一次 Renew，看是否弹出 Create Invoice 或直接跳转 ----
+        log("🖱️ 准备点击 Renew 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
         create_btn = page.locator('button:has-text("Create Invoice")')
-        try:
-            renew_btn.wait_for(state="visible", timeout=10000)
-            renew_btn.scroll_into_view_if_needed()
-            log("🖱️ 点击 Renew（一次）...")
-            try:
-                renew_btn.click(timeout=15000)
-            except Exception as e:
-                log(f"⚠️ 普通点击失败: {e}")
-            try:
-                renew_btn.evaluate("el => el.click()")
-            except Exception as e:
-                log(f"⚠️ JS 点击失败: {e}")
-        except Exception as e:
-            log(f"❌ Renew 按钮不可用: {e}")
 
         modal_opened = False
-        start = time.time()
-        while time.time() - start < 30:
-            time.sleep(2)
-            if _check_not_time():
-                return "NOT_TIME"
-            if "/payment/invoice/" in page.url:
-                log(f"🎉 点击 Renew 后进入发票页面: {page.url}")
-                return _pay_invoice_url(page, page.url)
+        for i in range(6):
             try:
-                if create_btn.is_visible():
-                    modal_opened = True
-                    log("✅ Create Invoice 弹窗已弹出")
-                    break
-            except Exception:
-                pass
+                renew_btn.wait_for(state="visible", timeout=10000)
+                renew_btn.scroll_into_view_if_needed()
+                log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
+                renew_btn.click()
 
-        if modal_opened:
+                # 动态轮询检测是否出现“未到续期时间”提示或正常弹出 Create Invoice
+                start_poll = time.time()
+                while time.time() - start_poll < 8:
+                    time.sleep(1)
+                    page_text = page.locator("body").inner_text().lower()
+                    if any(k in page_text for k in [
+                        "renewal restricted", "can only renew", "you can only renew", 
+                        "renouvellement restreint", "too early"
+                    ]):
+                        log("⚠️ 未到续期时间，无法续期。")
+                        page.screenshot(path="renew_not_allowed.png")
+                        return "NOT_TIME"   # 特殊状态
+
+                    if create_btn.is_visible():
+                        modal_opened = True
+                        log("✅ 弹窗已成功弹出！")
+                        break
+
+                    # 检查是否直接跳转或出现未支付发票
+                    if "/payment/invoice/" in page.url:
+                        modal_opened = True
+                        log("✅ 已直接进入发票页面！")
+                        break
+
+                if modal_opened:
+                    break
+
+                log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+                time.sleep(2)
+            except Exception as e:
+                log(f"❌ 点击尝试出错: {e}")
+
+        if not modal_opened:
+            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
+            page.screenshot(path="renew_modal_failed.png")
+            return False
+
+        if "/payment/invoice/" in page.url:
+            new_invoice_url = page.url
+        else:
             # 弹窗内先完成 Turnstile 人机验证，再提交
             handle_cloudflare(page, timeout=60)
             if not solve_modal_turnstile(page, timeout=90):
@@ -712,24 +655,28 @@ def renew_service(page):
                 log("❌ 未能进入发票页面，超时。")
                 page.screenshot(path="renew_stuck_invoice.png")
                 return False
-            return _pay_invoice_url(page, new_invoice_url)
 
-        # ---- 步骤3: 发票列表找新周期账单（到期日当天系统生成）----
-        due = get_due_date(page)
-        log(f"📆 当前到期日 {due}，去发票列表查找新周期账单...")
-        new_url = _find_new_period_invoice(page, due)
-        if new_url:
-            return _pay_invoice_url(page, new_url)
+        if page.url != new_invoice_url:
+            page.goto(new_invoice_url)
+        handle_cloudflare(page)
 
-        log("ℹ️ 新周期账单尚未生成（到期日当天稍后一般会生成），本次无可支付账单")
-        page.screenshot(path="renew_no_invoice.png")
-        return "NO_INVOICE"
+        log("🔎 查找 Pay 按钮...")
+        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+        pay_btn.wait_for(state="visible", timeout=30000)
+        pay_btn.click()
+        log("✅ Pay 按钮已点击")
+
+        # 等待支付确认页面或跳转回服务页
+        time.sleep(5)
+        # 返回服务管理页面以获取新的到期时间
+        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
+        return True
 
     except Exception as e:
         log(f"❌ 续费异常: {e}")
         page.screenshot(path="renew_error.png")
         return False
-
 
 def main():
     # 检查必要环境变量
@@ -777,9 +724,6 @@ def main():
             if renew_result == "NOT_TIME":
                 log("⏳ 未到续期时间，目前无法续期")
                 status = "⏳ 未到续期时间"
-            elif renew_result == "NO_INVOICE":
-                log("ℹ️ 新周期账单尚未生成，稍后重试")
-                status = "ℹ️ 新账单未生成"
             elif renew_result is False:
                 log("❌ 续费失败，脚本退出。")
                 status = "❌ 续期失败"
@@ -792,8 +736,6 @@ def main():
             send_telegram_notification(status, old_due, new_due, current_ip)
 
             if renew_result == "NOT_TIME":
-                sys.exit(0)
-            elif renew_result == "NO_INVOICE":
                 sys.exit(0)
             elif renew_result is False:
                 sys.exit(1)
