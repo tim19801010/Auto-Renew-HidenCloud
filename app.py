@@ -568,8 +568,21 @@ def renew_service(page):
         renew_btn = page.locator('button:has-text("Renew")')
         create_btn = page.locator('button:has-text("Create Invoice")')
 
+        # Renew 是 Flowbite 弹窗触发器（data-modal-toggle），必须等目标弹窗
+        # 元素挂载到 DOM 后再点，否则点击无反应（2026-10-16 故障根因）
+        try:
+            modal_id = renew_btn.get_attribute("data-modal-target")
+            if modal_id:
+                log(f"ℹ️ 等待弹窗组件 #{modal_id} 就绪...")
+                page.locator(f"#{modal_id}").wait_for(state="attached", timeout=90000)
+                log("✅ 弹窗组件已就绪")
+            else:
+                log("⚠️ 未找到 data-modal-target，直接尝试点击")
+        except Exception as e:
+            log(f"⚠️ 等待弹窗组件超时，仍尝试点击: {e}")
+
         modal_opened = False
-        for i in range(6):
+        for i in range(10):
             try:
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
@@ -578,7 +591,7 @@ def renew_service(page):
 
                 # 动态轮询检测是否出现“未到续期时间”提示或正常弹出 Create Invoice
                 start_poll = time.time()
-                while time.time() - start_poll < 8:
+                while time.time() - start_poll < 15:
                     time.sleep(1)
                     page_text = page.locator("body").inner_text().lower()
                     if any(k in page_text for k in [
