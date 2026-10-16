@@ -599,6 +599,36 @@ def renew_service(page):
                 pass
             return False
 
+        def _dump_diagnostics(tag):
+            """把 Renew 按钮/可疑 Pay 元素/所有页面 URL 的结构信息记入日志并保存 HTML"""
+            try:
+                html = page.content()
+                open(f"diag_{tag}.html", "w", encoding="utf-8").write(html)
+                log(f"🔍 已保存页面 HTML: diag_{tag}.html ({len(html)} 字符)")
+            except Exception as e:
+                log(f"⚠️ 保存 HTML 失败: {e}")
+            try:
+                outer = renew_btn.evaluate("el => el.outerHTML.slice(0, 600)")
+                log(f"🔍 Renew 按钮 HTML: {outer}")
+            except Exception as e:
+                log(f"⚠️ 读取 Renew 按钮 HTML 失败: {e}")
+            try:
+                urls = [pg.url for pg in page.context.pages]
+                log(f"🔍 当前所有页面 URL: {urls}")
+            except Exception as e:
+                log(f"⚠️ 读取页面列表失败: {e}")
+            try:
+                pays = page.locator('a:has-text("Pay"), button:has-text("Pay")').all()
+                log(f"🔍 含 'Pay' 的元素共 {len(pays)} 个:")
+                for el in pays[:8]:
+                    try:
+                        info = el.evaluate("el => ({tag: el.tagName, visible: el.offsetParent !== null, text: (el.innerText||'').slice(0,80), href: el.getAttribute('href')||'', cls: (el.className||'').toString().slice(0,80)})")
+                        log(f"   - {info}")
+                    except Exception as e:
+                        log(f"   - 读取失败: {e}")
+            except Exception as e:
+                log(f"⚠️ 枚举 Pay 元素失败: {e}")
+
         # 只点一次，然后长时间等待、自动寻找 Pay 入口
         log("\U0001F5B1\U0000FE0F 点击 Renew（仅一次）...")
         _click_renew_once()
@@ -671,6 +701,7 @@ def renew_service(page):
             except Exception as e:
                 log(f"⚠️ 发票列表兜底失败: {e}")
             if not direct_invoice_url:
+                _dump_diagnostics("renew_failed")
                 return False
 
         if direct_invoice_url:
