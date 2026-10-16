@@ -574,15 +574,23 @@ def renew_service(page):
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click()
+                try:
+                    renew_btn.click(timeout=15000)
+                except Exception as e:
+                    log(f"⚠️ 普通点击失败: {e}")
+                # 补一次 JS 直接点击：绕过可能的透明遮挡层/滚动偏移导致的"点了没反应"
+                try:
+                    renew_btn.evaluate("el => el.click()")
+                except Exception as e:
+                    log(f"⚠️ JS 点击失败: {e}")
 
                 # 动态轮询检测是否出现“未到续期时间”提示或正常弹出 Create Invoice
                 start_poll = time.time()
-                while time.time() - start_poll < 8:
+                while time.time() - start_poll < 15:
                     time.sleep(1)
                     page_text = page.locator("body").inner_text().lower()
                     if any(k in page_text for k in [
-                        "renewal restricted", "can only renew", "you can only renew", 
+                        "renewal restricted", "can only renew", "you can only renew",
                         "renouvellement restreint", "too early"
                     ]):
                         log("⚠️ 未到续期时间，无法续期。")
@@ -594,6 +602,15 @@ def renew_service(page):
                         log("✅ 弹窗已成功弹出！")
                         break
 
+                    # 兜底：页面出现任何弹窗容器也算 modal 打开（避免选择器变更导致漏检）
+                    try:
+                        if page.locator('[role="dialog"], .modal.show, .swal2-popup, div[class*="modal-dialog"]').first.is_visible():
+                            modal_opened = True
+                            log("ℹ️ 检测到弹窗容器，继续处理...")
+                            break
+                    except Exception:
+                        pass
+
                     # 检查是否直接跳转或出现未支付发票
                     if "/payment/invoice/" in page.url:
                         modal_opened = True
@@ -604,13 +621,39 @@ def renew_service(page):
                     break
 
                 log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+                page.screenshot(path=f"renew_retry_{i+1}.png")
                 time.sleep(2)
             except Exception as e:
                 log(f"❌ 点击尝试出错: {e}")
 
         if not modal_opened:
-            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
+            log("❌ 多次点击后续费弹窗仍未出现，尝试从发票列表查找未支付账单...")
             page.screenshot(path="renew_modal_failed.png")
+            # 兜底：Next Invoice 当天系统可能已自动生成账单，去发票列表找未支付的
+            try:
+                page.goto(f"{BASE_URL}/invoices", wait_until="domcontentloaded", timeout=60000)
+                handle_cloudflare(page)
+                time.sleep(2)
+                unpaid = page.locator('a[href*="/payment/invoice/"]').first
+                if unpaid.is_visible():
+                    log("ℹ️ 在发票列表中找到未支付账单，前往支付...")
+                    unpaid.click()
+                    time.sleep(3)
+                    handle_cloudflare(page)
+                    if "/payment/invoice/" in page.url:
+                        log(f"🎉 页面已跳转至发票: {page.url}")
+                        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+                        pay_btn.wait_for(state="visible", timeout=30000)
+                        pay_btn.click()
+                        log("✅ Pay 按钮已点击")
+                        time.sleep(5)
+                        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                        handle_cloudflare(page)
+                        return True
+                else:
+                    log("ℹ️ 发票列表中没有可支付的账单")
+            except Exception as e:
+                log(f"⚠️ 发票列表兜底失败: {e}")
             return False
 
         if "/payment/invoice/" in page.url:
