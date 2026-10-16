@@ -542,18 +542,6 @@ def renew_service(page):
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
-        # ===== 临时诊断：抓服务页 HTML（跑完即删）=====
-        try:
-            open("diag_service_page.html", "w", encoding="utf-8").write(page.content())
-            log("🔍 已保存服务页 HTML")
-            rb = page.locator('button:has-text("Renew")')
-            log(f"🔍 Renew 按钮 outerHTML: {rb.evaluate('el => el.outerHTML').strip()[:600]}")
-            log(f"🔍 Renew 按钮父元素: {rb.evaluate('el => el.parentElement.outerHTML').strip()[:400]}")
-            n = page.locator('button:has-text("Renew")').count()
-            log(f"🔍 Renew 按钮数量: {n}")
-        except Exception as e:
-            log(f"⚠️ 诊断失败: {e}")
-        # ===== 临时诊断结束 =====
 
         # 检查是否已存在待支付的续期账单（比如系统或上次运行已生成）
         pending_invoice = page.locator('a[href*="/payment/invoice/"], a:has-text("view and pay"), a:has-text("View and pay")').first
